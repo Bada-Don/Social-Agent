@@ -1,6 +1,7 @@
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import { setupWhatsappRoutes } from "./routes/whatsapp";
+import { setupDigestRoutes } from "./routes/digest";
 
 const server = Fastify({ logger: true });
 
@@ -10,6 +11,7 @@ server.register(cors, {
 
 // Register API Routes
 server.register(setupWhatsappRoutes, { prefix: '/api/whatsapp' });
+server.register(setupDigestRoutes, { prefix: '/api/digest' });
 
 server.get("/health", async () => {
   return { status: "Executive Agent Backend is Online" };

@@ -1,6 +1,15 @@
 "use client";
 
-import { AlertCircle, Clock, CheckCircle2, MessageSquare, Check } from "lucide-react";
+import {
+  AlertCircle,
+  Clock,
+  CheckCircle2,
+  MessageSquare,
+  Check,
+  ChevronDown,
+  ChevronUp,
+  Sparkles,
+} from "lucide-react";
 import { useEffect, useState } from "react";
 import { auth, db } from "@/lib/firebase";
 import {
@@ -10,6 +19,8 @@ import {
   query,
   where,
   updateDoc,
+  orderBy,
+  limit,
 } from "firebase/firestore";
 import { onAuthStateChanged } from "firebase/auth";
 
@@ -17,8 +28,15 @@ interface UnreadMessage {
   id: string;
   sender: string;
   text: string;
+  summary: string | null;
   timestamp: Date;
   urgency: string;
+}
+
+interface Digest {
+  date: string;
+  content: string;
+  messageCount: number;
 }
 
 function formatSender(jid: string): string {
@@ -34,13 +52,20 @@ function truncateText(text: string, max = 72): string {
 }
 
 function timeAgo(date: Date): string {
-  const seconds = Math.floor((Date.now() - date.getTime()) / 1000);
-  if (seconds < 60) return "just now";
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes}m ago`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours}h ago`;
-  return `${Math.floor(hours / 24)}d ago`;
+  const s = Math.floor((Date.now() - date.getTime()) / 1000);
+  if (s < 60) return "just now";
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  return `${Math.floor(h / 24)}d ago`;
+}
+
+function greetingByHour(): string {
+  const h = new Date().getHours();
+  if (h < 12) return "Good Morning";
+  if (h < 17) return "Good Afternoon";
+  return "Good Evening";
 }
 
 export default function Dashboard() {
@@ -50,6 +75,8 @@ export default function Dashboard() {
   const [waConnected, setWaConnected] = useState(false);
   const [markingRead, setMarkingRead] = useState<string | null>(null);
   const [currentUid, setCurrentUid] = useState<string | null>(null);
+  const [digest, setDigest] = useState<Digest | null>(null);
+  const [digestOpen, setDigestOpen] = useState(true);
 
   const unreadCount = unreadMessages.length;
 
@@ -61,19 +88,17 @@ export default function Dashboard() {
         setTaskCount(0);
         setWaConnected(false);
         setCurrentUid(null);
+        setDigest(null);
         return;
       }
 
       setCurrentUid(user.uid);
 
-      // ─── Unread messages ───────────────────────────────────────────────────
-      // Simple single-field query — no composite index needed.
-      // We sort by timestamp on the client side.
+      // ── Unread messages (single-field query, sort client-side) ──────────
       const qMsgs = query(
         collection(db, "users", user.uid, "messages"),
         where("processed", "==", false)
       );
-
       const unsubMsgs = onSnapshot(qMsgs, (snap) => {
         const msgs: UnreadMessage[] = snap.docs
           .map((d) => {
@@ -82,19 +107,16 @@ export default function Dashboard() {
               id: d.id,
               sender: data.sender ?? "",
               text: data.text ?? "",
-              // Firestore Timestamp → JS Date; fall back to epoch so sort still works
+              summary: data.summary ?? null,
               timestamp: data.timestamp?.toDate?.() ?? new Date(0),
               urgency: data.urgency ?? "low",
             };
           })
-          // Newest first — done client-side to avoid needing a composite index
           .sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime());
-
         setUnreadMessages(msgs);
       });
 
-      // ─── Urgent items ──────────────────────────────────────────────────────
-      // Two equality filters on the same collection — allowed without extra index.
+      // ── Urgent items ────────────────────────────────────────────────────
       const qUrgent = query(
         collection(db, "users", user.uid, "messages"),
         where("urgency", "==", "high"),
@@ -104,7 +126,7 @@ export default function Dashboard() {
         setUrgentCount(snap.docs.length)
       );
 
-      // ─── Tasks today ───────────────────────────────────────────────────────
+      // ── Tasks today ─────────────────────────────────────────────────────
       const qTasks = query(
         collection(db, "users", user.uid, "tasks"),
         where("status", "==", "todo")
@@ -113,18 +135,33 @@ export default function Dashboard() {
         setTaskCount(snap.docs.length)
       );
 
-      // ─── WhatsApp connection status ────────────────────────────────────────
+      // ── WhatsApp connection status ───────────────────────────────────────
       const unsubDoc = onSnapshot(doc(db, "users", user.uid), (docSnap) => {
         if (docSnap.exists()) {
           setWaConnected(docSnap.data().settings?.whatsappConnected === true);
         }
       });
 
+      // ── Today's digest ───────────────────────────────────────────────────
+      const today = new Date().toISOString().split("T")[0];
+      const unsubDigest = onSnapshot(
+        doc(db, "users", user.uid, "digests", today),
+        (snap) => {
+          if (snap.exists()) {
+            const d = snap.data();
+            setDigest({ date: d.date, content: d.content, messageCount: d.messageCount });
+          } else {
+            setDigest(null);
+          }
+        }
+      );
+
       return () => {
         unsubMsgs();
         unsubUrgent();
         unsubTasks();
         unsubDoc();
+        unsubDigest();
       };
     });
 
@@ -135,11 +172,9 @@ export default function Dashboard() {
     if (!currentUid) return;
     setMarkingRead(msgId);
     try {
-      await updateDoc(
-        doc(db, "users", currentUid, "messages", msgId),
-        { processed: true }
-      );
-      // The onSnapshot listener above will automatically remove it from the list
+      await updateDoc(doc(db, "users", currentUid, "messages", msgId), {
+        processed: true,
+      });
     } catch (err) {
       console.error("[Dashboard] Failed to mark message as read:", err);
     } finally {
@@ -154,17 +189,17 @@ export default function Dashboard() {
 
   return (
     <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-700">
+      {/* Header */}
       <header className="flex justify-between items-start flex-col gap-2 sm:flex-row sm:items-center">
         <div>
           <h1 className="text-3xl font-semibold tracking-tight text-white">
-            Good Morning, Chief.
+            {greetingByHour()}, Chief.
           </h1>
           <p className="text-gray-400 mt-1">
             Here is what requires your attention today.
           </p>
         </div>
 
-        {/* Real-time Connection Indicator */}
         <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-white/5 border border-white/10">
           <MessageSquare size={14} className="text-gray-400" />
           <span className="text-xs font-medium text-gray-300">WhatsApp</span>
@@ -217,6 +252,37 @@ export default function Dashboard() {
         </div>
       </div>
 
+      {/* Daily Digest */}
+      {digest && (
+        <section className="glass rounded-xl overflow-hidden">
+          <button
+            onClick={() => setDigestOpen((o) => !o)}
+            className="w-full flex items-center justify-between px-5 py-4 hover:bg-white/5 transition-colors"
+          >
+            <div className="flex items-center gap-2">
+              <Sparkles size={16} className="text-primary" />
+              <span className="text-sm font-semibold text-white">Today&apos;s AI Digest</span>
+              <span className="text-xs text-gray-600 bg-white/5 px-2 py-0.5 rounded-full">
+                {digest.messageCount} messages
+              </span>
+            </div>
+            {digestOpen ? (
+              <ChevronUp size={16} className="text-gray-500" />
+            ) : (
+              <ChevronDown size={16} className="text-gray-500" />
+            )}
+          </button>
+
+          {digestOpen && (
+            <div className="px-5 pb-5 border-t border-white/5">
+              <div className="mt-4 text-sm text-gray-300 leading-relaxed whitespace-pre-wrap">
+                {digest.content}
+              </div>
+            </div>
+          )}
+        </section>
+      )}
+
       {/* Unread Message Previews */}
       {unreadMessages.length > 0 && (
         <section>
@@ -239,7 +305,6 @@ export default function Dashboard() {
                 key={msg.id}
                 className="glass rounded-xl px-4 py-3 flex items-start gap-3 hover:bg-white/5 transition-colors group"
               >
-                {/* Urgency dot */}
                 <span
                   className={`mt-2 flex-shrink-0 h-2 w-2 rounded-full ${
                     msg.urgency === "high"
@@ -259,12 +324,17 @@ export default function Dashboard() {
                       {timeAgo(msg.timestamp)}
                     </span>
                   </div>
+                  {/* Show AI summary if available, raw text as fallback */}
                   <p className="text-sm text-white mt-0.5 leading-snug">
-                    {truncateText(msg.text)}
+                    {msg.summary ? truncateText(msg.summary) : truncateText(msg.text)}
                   </p>
+                  {msg.summary && (
+                    <p className="text-xs text-gray-700 italic mt-0.5 truncate">
+                      {truncateText(msg.text, 60)}
+                    </p>
+                  )}
                 </div>
 
-                {/* Mark as read button */}
                 <button
                   onClick={() => markAsRead(msg.id)}
                   disabled={markingRead === msg.id}
@@ -278,8 +348,6 @@ export default function Dashboard() {
           </div>
         </section>
       )}
-
-      {/* Rest of dashboard will hold Digest & recent AI insights */}
     </div>
   );
 }
